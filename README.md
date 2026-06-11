@@ -2,7 +2,7 @@
 
 A Telegram AI agent for **paper trading only**.
 
-It scans Binance USDT perpetuals, finds intraday setups, calculates:
+It scans Bybit USDT perpetuals, finds intraday setups, calculates:
 - Entry zone
 - Stop Loss
 - Take Profits
@@ -75,7 +75,7 @@ DEFAULT_MAX_HOLD_MINUTES=240
 
 ## How it works
 
-1. Fetches Binance Futures USDT perpetual symbols.
+1. Fetches Bybit USDT perpetual symbols.
 2. Filters by liquidity and 24h movement.
 3. Pulls 15m and 5m candles.
 4. Calculates EMA20/EMA50, RSI, ATR, volume spike.
@@ -89,3 +89,18 @@ DEFAULT_MAX_HOLD_MINUTES=240
 This is for TradingView paper trading / testing only.
 Crypto futures are high risk.
 The bot can be wrong.
+
+
+## Bybit patch
+
+This version uses Bybit V5 public market API:
+- /v5/market/instruments-info
+- /v5/market/tickers
+- /v5/market/kline
+
+Railway variables:
+
+```env
+BYBIT_BASE_URL=https://api.bybit.com
+BYBIT_CATEGORY=linear
+```
