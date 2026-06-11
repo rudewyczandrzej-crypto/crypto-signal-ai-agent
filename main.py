@@ -38,7 +38,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
-BINANCE_FUTURES_BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").strip().rstrip("/")
+BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").strip().rstrip("/")
+BYBIT_CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip()
 
 SIGNAL_SCAN_INTERVAL_SECONDS = int(os.getenv("SIGNAL_SCAN_INTERVAL_SECONDS", "900"))
 SIGNAL_MANAGE_INTERVAL_SECONDS = int(os.getenv("SIGNAL_MANAGE_INTERVAL_SECONDS", "300"))
@@ -80,6 +81,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("crypto-signal-ai")
+APP_VERSION = "crypto-signal-ai-bybit-v1"
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -286,7 +288,7 @@ def update_signal_status(signal_id: int, status: str, exit_price: Optional[float
 
 
 # =========================
-# BINANCE API
+# BYBIT API
 # =========================
 
 class MarketFetchError(Exception):
@@ -296,27 +298,35 @@ class MarketFetchError(Exception):
         self.message = message
 
 
-def binance_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = f"{BINANCE_FUTURES_BASE_URL}{path}"
+def bybit_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = f"{BYBIT_BASE_URL}{path}"
 
     try:
         response = http.get(url, params=params or {}, timeout=30)
     except Exception as e:
         raise MarketFetchError("network_error", str(e))
 
-    if response.status_code in [401, 403, 418, 429]:
-        raise MarketFetchError("binance_limited", f"Binance HTTP {response.status_code}: {response.text[:300]}")
+    if response.status_code in [401, 403, 418, 429, 451]:
+        raise MarketFetchError("bybit_limited", f"Bybit HTTP {response.status_code}: {response.text[:300]}")
 
     if response.status_code >= 500:
-        raise MarketFetchError("binance_server_error", f"Binance server error {response.status_code}: {response.text[:300]}")
+        raise MarketFetchError("bybit_server_error", f"Bybit server error {response.status_code}: {response.text[:300]}")
 
     if response.status_code >= 400:
-        raise MarketFetchError("binance_http_error", f"Binance HTTP {response.status_code}: {response.text[:300]}")
+        raise MarketFetchError("bybit_http_error", f"Bybit HTTP {response.status_code}: {response.text[:300]}")
 
     try:
-        return response.json()
+        data = response.json()
     except Exception:
-        raise MarketFetchError("bad_json", f"Binance returned non-JSON: {response.text[:300]}")
+        raise MarketFetchError("bad_json", f"Bybit returned non-JSON: {response.text[:300]}")
+
+    if isinstance(data, dict) and data.get("retCode") not in [0, "0", None]:
+        raise MarketFetchError(
+            "bybit_api_error",
+            f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+        )
+
+    return data
 
 
 _SYMBOL_CACHE: Optional[set] = None
@@ -324,52 +334,144 @@ _SYMBOL_CACHE_TS = 0.0
 
 
 def get_usdt_perp_symbols() -> set:
+    """
+    Get Bybit USDT perpetual symbols through V5 instruments-info.
+    Bybit may paginate linear instruments, so cursor is supported.
+    """
     global _SYMBOL_CACHE, _SYMBOL_CACHE_TS
 
     now = time.time()
     if _SYMBOL_CACHE and now - _SYMBOL_CACHE_TS < 3600:
         return _SYMBOL_CACHE
 
-    data = binance_get("/fapi/v1/exchangeInfo")
     symbols = set()
+    cursor = None
 
-    for s in data.get("symbols", []):
-        if (
-            s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("status") == "TRADING"
-        ):
-            symbols.add(s.get("symbol"))
+    while True:
+        params = {
+            "category": BYBIT_CATEGORY,
+            "status": "Trading",
+            "limit": 1000,
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        data = bybit_get("/v5/market/instruments-info", params)
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        rows = result.get("list", []) or []
+
+        for s in rows:
+            symbol = s.get("symbol")
+            quote_coin = s.get("quoteCoin")
+            status = s.get("status")
+            contract_type = s.get("contractType")
+
+            if (
+                symbol
+                and quote_coin == "USDT"
+                and status == "Trading"
+                and contract_type in ["LinearPerpetual", "PERPETUAL", None]
+            ):
+                symbols.add(symbol)
+
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
 
     _SYMBOL_CACHE = symbols
     _SYMBOL_CACHE_TS = now
+
     return symbols
 
 
 def fetch_24h_tickers() -> List[Dict[str, Any]]:
-    data = binance_get("/fapi/v1/ticker/24hr")
-    if not isinstance(data, list):
-        raise MarketFetchError("api_changed", "Binance ticker returned unexpected format")
-    return data
+    data = bybit_get("/v5/market/tickers", {"category": BYBIT_CATEGORY})
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+    rows = result.get("list", []) or []
+
+    if not isinstance(rows, list):
+        raise MarketFetchError("api_changed", "Bybit tickers returned unexpected format")
+
+    normalized = []
+
+    for t in rows:
+        symbol = t.get("symbol")
+        last_price = safe_float(t.get("lastPrice"))
+        prev_24h = safe_float(t.get("prevPrice24h"))
+        price24h_pcnt = safe_float(t.get("price24hPcnt"))
+        turnover_24h = safe_float(t.get("turnover24h"))
+        volume_24h = safe_float(t.get("volume24h"))
+
+        # Bybit price24hPcnt is decimal: 0.0123 means +1.23%.
+        price_change_percent = None
+        if price24h_pcnt is not None:
+            price_change_percent = price24h_pcnt * 100
+
+        normalized.append({
+            "symbol": symbol,
+            "lastPrice": last_price,
+            "prevPrice24h": prev_24h,
+            "priceChangePercent": price_change_percent,
+            "quoteVolume": turnover_24h,
+            "volume": volume_24h,
+            "raw": t,
+        })
+
+    return normalized
 
 
 def fetch_klines(symbol: str, interval: str, limit: int = 150) -> List[List[Any]]:
-    data = binance_get("/fapi/v1/klines", {
+    # Bybit style "15m" -> Bybit style "15"
+    bybit_interval = interval.replace("m", "")
+
+    data = bybit_get("/v5/market/kline", {
+        "category": BYBIT_CATEGORY,
         "symbol": symbol,
-        "interval": interval,
+        "interval": bybit_interval,
         "limit": limit,
     })
 
-    if not isinstance(data, list):
-        raise MarketFetchError("api_changed", "Binance klines returned unexpected format")
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+    rows = result.get("list", []) or []
 
-    return data
+    if not isinstance(rows, list):
+        raise MarketFetchError("api_changed", "Bybit kline returned unexpected format")
+
+    # Bybit returns newest first:
+    # [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+    rows = list(reversed(rows))
+
+    normalized = []
+
+    for row in rows:
+        start_time = float(row[0])
+        normalized.append([
+            start_time,
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            start_time,
+        ])
+
+    return normalized
 
 
 def fetch_current_price(symbol: str) -> Optional[float]:
-    data = binance_get("/fapi/v1/ticker/price", {"symbol": symbol})
-    return safe_float(data.get("price")) if isinstance(data, dict) else None
+    data = bybit_get("/v5/market/tickers", {
+        "category": BYBIT_CATEGORY,
+        "symbol": symbol,
+    })
 
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+    rows = result.get("list", []) or []
+
+    if not rows:
+        return None
+
+    return safe_float(rows[0].get("lastPrice"))
 
 # =========================
 # INDICATORS
@@ -1087,7 +1189,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 👋 Привіт! Я <b>Crypto Signal AI</b>.
 
 Я шукаю тестові intraday-сигнали для <b>paper trading</b>:
-• сам вибираю монети з Binance Futures
+• сам вибираю монети з Bybit USDT Perpetuals
 • рахую тренд / обʼєм / RSI / ATR / рівні
 • Groq AI фільтрує слабкі і FOMO-сигнали
 • даю entry zone, SL, TP, leverage, max hold time
@@ -1121,7 +1223,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /status — показати налаштування
 
 <b>Як працює:</b>
-1. Бот бере Binance USDT perpetuals.
+1. Бот бере Bybit USDT perpetuals.
 2. Вибирає монети з обʼємом і рухом.
 3. Рахує 15m/5m структуру, EMA, RSI, ATR, volume spike.
 4. Формує кандидат-сигнал.
@@ -1144,7 +1246,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     telegram_id = str(chat.id)
     ensure_user(telegram_id)
 
-    await update.message.reply_text("🔍 Сканую Binance Futures і шукаю тестові intraday-сигнали...")
+    await update.message.reply_text("🔍 Сканую Bybit USDT Perpetuals і шукаю тестові intraday-сигнали...")
 
     try:
         signals = scan_for_signals()
@@ -1253,7 +1355,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = f"""
 ⚙️ <b>Crypto Signal AI status</b>
 
-<b>Market:</b> Binance Futures public API
+<b>Market:</b> Bybit USDT Perpetuals public API
 <b>AI:</b> Groq — {escape(GROQ_MODEL)}
 
 <b>Scan interval:</b> {SIGNAL_SCAN_INTERVAL_SECONDS} sec
